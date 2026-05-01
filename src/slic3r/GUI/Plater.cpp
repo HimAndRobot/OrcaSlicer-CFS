@@ -3,6 +3,7 @@
 #include "libslic3r_version.h"
 
 #include <cstddef>
+#include <cctype>
 #include <algorithm>
 #include <numeric>
 #include <limits>
@@ -10,7 +11,14 @@
 #include <string>
 #include <regex>
 #include <future>
+#include <thread>
+#include <mutex>
+#include <unordered_map>
 #include <boost/algorithm/string.hpp>
+#include <boost/asio/connect.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/websocket.hpp>
 #include <boost/iterator/counting_iterator.hpp>
 #include <boost/optional.hpp>
 #include <boost/filesystem/path.hpp>
@@ -37,6 +45,7 @@
 #include <wx/debug.h>
 #include <wx/busyinfo.h>
 #include <wx/event.h>
+#include <wx/msgdlg.h>
 #include <wx/wrapsizer.h>
 #ifdef _WIN32
 #include <wx/richtooltip.h>
@@ -137,6 +146,7 @@
 #include "Widgets/CheckBox.hpp"
 #include "Widgets/Button.hpp"
 #include "Widgets/StaticGroup.hpp"
+#include "Widgets/HyperLink.hpp"
 
 #include "GUI_ObjectTable.hpp"
 #include "libslic3r/Thread.hpp"
@@ -150,6 +160,8 @@
 #include <libslic3r/miniz_extension.hpp>
 #include "WipeTowerDialog.hpp"
 #include "ObjColorDialog.hpp"
+
+#include <unordered_set>
 
 #include "libslic3r/CustomGCode.hpp"
 #include "libslic3r/Platform.hpp"
@@ -352,6 +364,559 @@ static wxString temp_dir;
 
 namespace {
 
+namespace beast = boost::beast;
+namespace websocket = beast::websocket;
+namespace net = boost::asio;
+using tcp = net::ip::tcp;
+
+constexpr std::chrono::seconds cfs_socket_timeout{2};
+constexpr std::chrono::seconds cfs_socket_recent_success_window{15};
+constexpr int                  cfs_socket_poll_interval_ms = 3000;
+constexpr int                  cfs_socket_retry_ms = 1200;
+constexpr int                  cfs_socket_heartbeat_ms = 10000;
+constexpr int                  cfs_socket_idle_sleep_ms = 100;
+constexpr const char*          cfs_auto_sync_config_key = "cfs_color_auto_sync";
+constexpr const char*          cfs_auto_apply_preset_config_key = "cfs_auto_apply_filament_preset";
+constexpr const char*          cfs_preset_map_pla_config_key = "cfs_preset_map_pla";
+constexpr const char*          cfs_preset_map_petg_config_key = "cfs_preset_map_petg";
+constexpr const char*          cfs_preset_map_config_prefix = "cfs_preset_map_";
+constexpr size_t               cfs_slot_count = 4;
+
+struct CfsMaterialPresetDefinition
+{
+    const char* type;
+    const char* rfid;
+    const char* vendor;
+    const char* name;
+    const char* temp_min;
+    const char* temp_max;
+    const char* pressure;
+};
+
+constexpr CfsMaterialPresetDefinition cfs_material_preset_definitions[] = {
+    {"PLA",      "00001", "Generic", "Generic PLA",       "190", "240", "0.04"},
+    {"PLA-SILK", "00005", "Generic", "Generic PLA-Silk",  "190", "240", "0.052"},
+    {"PETG",     "00013", "Generic", "Generic PETG",      "220", "270", "0.08"},
+    {"ABS",      "00003", "Generic", "Generic ABS",       "240", "280", "0.06"},
+    {"ASA",      "00004", "Generic", "Generic ASA",       "240", "280", "0.044"},
+    {"BVOH",     "00007", "Generic", "Generic BVOH",      "200", "220", "0.02"},
+    {"HIPS",     "00010", "Generic", "Generic HIPS",      "220", "250", "0.02"},
+    {"PA",       "00012", "Generic", "Generic PA",        "240", "260", "0.01"},
+    {"PA-CF",    "00008", "Generic", "Generic PA-CF",     "260", "300", "0.01"},
+    {"PC",       "00009", "Generic", "Generic PC",        "250", "270", "0.05"},
+    {"PET",      "00021", "Generic", "Generic PET",       "250", "270", "0.02"},
+    {"PET-CF",   "00020", "Generic", "Generic PET-CF",    "280", "320", "0.02"},
+    {"PETG-CF",  "00003", "Generic", "Generic PETG-CF",   "240", "260", "0.02"},
+    {"PLA-CF",   "00001", "Generic", "Generic PLA-CF",    "190", "240", "0.03"},
+    {"PA6-CF",   "",      "Generic", "Generic PA6-CF",    "280", "300", "0.02"},
+    {"PAHT-CF",  "",      "Generic", "Generic PAHT-CF",   "300", "320", "0.02"},
+    {"PP",       "00006", "Generic", "Generic PP",        "220", "260", "0.02"},
+    {"PPS",      "00019", "Generic", "Generic PPS",       "320", "350", "0.02"},
+    {"PPS-CF",   "00017", "Generic", "Generic PPS-CF",    "300", "350", "0.02"},
+    {"PVA",      "00005", "Generic", "Generic PVA",       "215", "225", "0.02"},
+    {"TPU",      "00011", "Generic", "Generic TPU",       "210", "240", "0.02"},
+    {"OTHER",    "",      "Generic", "Generic Material",  "200", "240", "0.04"},
+};
+
+std::string cfs_material_type_config_key(const std::string& material_type)
+{
+    if (material_type == "PLA")
+        return cfs_preset_map_pla_config_key;
+    if (material_type == "PETG")
+        return cfs_preset_map_petg_config_key;
+
+    std::string suffix;
+    suffix.reserve(material_type.size());
+    for (const unsigned char ch : material_type) {
+        if (std::isalnum(ch))
+            suffix.push_back(static_cast<char>(std::tolower(ch)));
+        else
+            suffix.push_back('_');
+    }
+    return std::string(cfs_preset_map_config_prefix) + suffix;
+}
+
+std::string cfs_default_preset_mapping(const std::string& material_type)
+{
+    if (material_type == "PLA")
+        return "Pla";
+    if (material_type == "PETG")
+        return "Petg";
+    return {};
+}
+
+std::vector<std::string> cfs_supported_material_types()
+{
+    std::vector<std::string> result;
+    result.reserve(std::size(cfs_material_preset_definitions));
+    std::unordered_set<std::string> seen;
+    for (const auto& definition : cfs_material_preset_definitions) {
+        if (seen.insert(definition.type).second)
+            result.emplace_back(definition.type);
+    }
+    return result;
+}
+
+struct CfsSlotMaterial
+{
+    int         box_id{1};
+    int         material_id{-1};
+    std::string rfid;
+    std::string color;
+    std::string type;
+    std::string vendor;
+    std::string name;
+    json        min_temp;
+    json        max_temp;
+    json        pressure;
+};
+
+struct CfsSocketRuntime
+{
+    mutable std::mutex         mutex;
+    bool                       connected{false};
+    bool                       stop_requested{false};
+    bool                       request_boxs_info{false};
+    bool                       has_recent_success{false};
+    std::vector<std::string>   colors;
+    std::vector<std::string>   material_types;
+    std::vector<CfsSlotMaterial> slot_materials = std::vector<CfsSlotMaterial>(cfs_slot_count);
+    std::vector<json>          pending_modify_materials;
+    std::string                host;
+    std::string                origin;
+    std::chrono::steady_clock::time_point last_success_at{};
+    size_t                     colors_generation{0};
+};
+
+struct CfsPendingLocalOverride
+{
+    std::string color;
+    std::string material_type;
+    std::chrono::steady_clock::time_point created_at{};
+};
+
+std::string normalize_cfs_color(const std::string& raw_color)
+{
+    std::string hex;
+    hex.reserve(raw_color.size());
+
+    for (unsigned char ch : raw_color) {
+        if (std::isxdigit(ch))
+            hex += static_cast<char>(std::toupper(ch));
+    }
+
+    if (hex.size() == 7 && hex.front() == '0')
+        hex = hex.substr(1);
+    else if (hex.size() == 8)
+        hex = hex.substr(2);
+    else if (hex.size() > 8)
+        hex = hex.substr(hex.size() - 6);
+
+    if (hex.size() != 6)
+        return {};
+
+    return "#" + hex;
+}
+
+std::string normalize_cfs_material_type(const std::string& raw_type)
+{
+    std::string normalized = raw_type;
+    boost::algorithm::trim(normalized);
+    boost::algorithm::to_upper(normalized);
+    return normalized;
+}
+
+json cfs_json_value_or_null(const json& material, std::initializer_list<const char*> keys)
+{
+    for (const char* key : keys) {
+        const auto it = material.find(key);
+        if (it != material.end() && !it->is_null())
+            return *it;
+    }
+    return nullptr;
+}
+
+std::string encode_cfs_printer_color(const std::string& raw_color)
+{
+    const std::string normalized = normalize_cfs_color(raw_color);
+    if (normalized.empty())
+        return {};
+
+    return "#0" + normalized.substr(1);
+}
+
+json cfs_build_modify_material_payload(const CfsSlotMaterial& slot, const std::string& color)
+{
+    return json{
+        {"boxId",    slot.box_id},
+        {"id",       slot.material_id},
+        {"rfid",     slot.rfid},
+        {"type",     slot.type},
+        {"vendor",   slot.vendor},
+        {"name",     slot.name},
+        {"color",    encode_cfs_printer_color(color)},
+        {"minTemp",  slot.min_temp.is_null() ? json(nullptr) : slot.min_temp},
+        {"maxTemp",  slot.max_temp.is_null() ? json(nullptr) : slot.max_temp},
+        {"pressure", slot.pressure.is_null() ? json("") : slot.pressure}
+    };
+}
+
+const CfsMaterialPresetDefinition* find_cfs_material_preset_definition(const std::string& material_type)
+{
+    for (const auto& definition : cfs_material_preset_definitions) {
+        if (material_type == definition.type)
+            return &definition;
+    }
+    return nullptr;
+}
+
+bool extract_cfs_materials_from_json(const json& node, std::vector<CfsSlotMaterial>& slot_materials)
+{
+    if (node.is_object()) {
+        const auto type_it      = node.find("type");
+        const auto box_id_it    = node.find("id");
+        const auto materials_it = node.find("materials");
+        const bool is_target_box =
+            type_it != node.end() &&
+            ((type_it->is_number_integer() && type_it->get<int>() == 0) ||
+             (type_it->is_string() && type_it->get<std::string>() == "0")) &&
+            materials_it != node.end() && materials_it->is_array();
+
+        if (is_target_box) {
+            std::vector<CfsSlotMaterial> extracted_slots(cfs_slot_count);
+            const int box_id = box_id_it != node.end() && box_id_it->is_number_integer() ? box_id_it->get<int>() : 1;
+            bool      found_slot_data = false;
+
+            for (const auto& material : *materials_it) {
+                if (!material.is_object())
+                    continue;
+
+                const auto id_it = material.find("id");
+                if (id_it == material.end() || !id_it->is_number_integer())
+                    continue;
+
+                const int slot_idx = id_it->get<int>();
+                if (slot_idx < 0 || slot_idx >= static_cast<int>(cfs_slot_count))
+                    continue;
+
+                auto& extracted_slot = extracted_slots[slot_idx];
+                extracted_slot.box_id = box_id;
+                extracted_slot.material_id = slot_idx;
+
+                if (const auto rfid_it = material.find("rfid"); rfid_it != material.end() && rfid_it->is_string())
+                    extracted_slot.rfid = rfid_it->get<std::string>();
+
+                if (const auto color_it = material.find("color"); color_it != material.end() && color_it->is_string()) {
+                    extracted_slot.color = normalize_cfs_color(color_it->get<std::string>());
+                    found_slot_data = found_slot_data || !extracted_slot.color.empty();
+                }
+
+                if (const auto type_field_it = material.find("type"); type_field_it != material.end() && type_field_it->is_string()) {
+                    extracted_slot.type = normalize_cfs_material_type(type_field_it->get<std::string>());
+                    found_slot_data = found_slot_data || !extracted_slot.type.empty();
+                }
+
+                if (const auto vendor_it = material.find("vendor"); vendor_it != material.end() && vendor_it->is_string())
+                    extracted_slot.vendor = vendor_it->get<std::string>();
+
+                if (const auto name_it = material.find("name"); name_it != material.end() && name_it->is_string())
+                    extracted_slot.name = name_it->get<std::string>();
+
+                extracted_slot.min_temp = cfs_json_value_or_null(material, {"minTemp", "nozzleTempMin", "minPrintTemp"});
+                extracted_slot.max_temp = cfs_json_value_or_null(material, {"maxTemp", "nozzleTempMax", "maxPrintTemp"});
+                extracted_slot.pressure = cfs_json_value_or_null(material, {"pressure"});
+            }
+
+            if (found_slot_data) {
+                slot_materials = std::move(extracted_slots);
+                return true;
+            }
+        }
+
+        for (auto it = node.begin(); it != node.end(); ++it) {
+            if (extract_cfs_materials_from_json(it.value(), slot_materials))
+                return true;
+        }
+    } else if (node.is_array()) {
+        for (const auto& item : node) {
+            if (extract_cfs_materials_from_json(item, slot_materials))
+                return true;
+        }
+    }
+
+    return false;
+}
+
+std::string extract_cfs_host_from_print_host(wxString print_host)
+{
+    print_host.Trim(true);
+    print_host.Trim(false);
+
+    if (print_host.empty())
+        return {};
+
+    if (!print_host.Lower().StartsWith("http://") && !print_host.Lower().StartsWith("https://"))
+        print_host = "http://" + print_host;
+
+    std::string host = into_u8(print_host);
+    boost::algorithm::trim(host);
+
+    if (const auto scheme_pos = host.find("://"); scheme_pos != std::string::npos)
+        host = host.substr(scheme_pos + 3);
+
+    if (const auto slash_pos = host.find('/'); slash_pos != std::string::npos)
+        host = host.substr(0, slash_pos);
+
+    if (const auto at_pos = host.rfind('@'); at_pos != std::string::npos)
+        host = host.substr(at_pos + 1);
+
+    if (!host.empty() && host.front() == '[') {
+        if (const auto end = host.find(']'); end != std::string::npos)
+            return host.substr(1, end - 1);
+        return {};
+    }
+
+    if (const auto colon_pos = host.rfind(':');
+        colon_pos != std::string::npos && host.find(':') == colon_pos)
+        host = host.substr(0, colon_pos);
+
+    return host;
+}
+
+void cfs_socket_set_connected(const std::shared_ptr<CfsSocketRuntime>& runtime, bool connected)
+{
+    std::lock_guard<std::mutex> lock(runtime->mutex);
+    runtime->connected = connected;
+}
+
+bool cfs_socket_should_stop(const std::shared_ptr<CfsSocketRuntime>& runtime)
+{
+    std::lock_guard<std::mutex> lock(runtime->mutex);
+    return runtime->stop_requested;
+}
+
+bool cfs_socket_consume_boxs_info_request(const std::shared_ptr<CfsSocketRuntime>& runtime)
+{
+    std::lock_guard<std::mutex> lock(runtime->mutex);
+    const bool should_request = runtime->request_boxs_info;
+    runtime->request_boxs_info = false;
+    return should_request;
+}
+
+void cfs_socket_store_materials(const std::shared_ptr<CfsSocketRuntime>& runtime, std::vector<std::string> colors, std::vector<std::string> material_types)
+{
+    std::lock_guard<std::mutex> lock(runtime->mutex);
+    runtime->colors = std::move(colors);
+    runtime->material_types = std::move(material_types);
+    runtime->has_recent_success = true;
+    runtime->last_success_at = std::chrono::steady_clock::now();
+    ++runtime->colors_generation;
+}
+
+void cfs_socket_store_materials(const std::shared_ptr<CfsSocketRuntime>& runtime, std::vector<CfsSlotMaterial> slot_materials)
+{
+    std::vector<std::string> colors(cfs_slot_count);
+    std::vector<std::string> material_types(cfs_slot_count);
+    for (size_t idx = 0; idx < std::min(slot_materials.size(), cfs_slot_count); ++idx) {
+        colors[idx] = slot_materials[idx].color;
+        material_types[idx] = slot_materials[idx].type;
+    }
+
+    std::lock_guard<std::mutex> lock(runtime->mutex);
+    runtime->slot_materials = std::move(slot_materials);
+    runtime->colors = std::move(colors);
+    runtime->material_types = std::move(material_types);
+    runtime->has_recent_success = true;
+    runtime->last_success_at = std::chrono::steady_clock::now();
+    ++runtime->colors_generation;
+}
+
+std::vector<json> cfs_socket_consume_pending_modify_materials(const std::shared_ptr<CfsSocketRuntime>& runtime)
+{
+    std::lock_guard<std::mutex> lock(runtime->mutex);
+    std::vector<json> pending = std::move(runtime->pending_modify_materials);
+    runtime->pending_modify_materials.clear();
+    return pending;
+}
+
+bool cfs_socket_queue_modify_material_payload(const std::shared_ptr<CfsSocketRuntime>& runtime, json payload)
+{
+    if (!runtime || payload.is_null() || !payload.is_object())
+        return false;
+
+    std::lock_guard<std::mutex> lock(runtime->mutex);
+    runtime->pending_modify_materials.emplace_back(std::move(payload));
+    runtime->request_boxs_info = true;
+    return true;
+}
+
+bool cfs_socket_queue_modify_material(const std::shared_ptr<CfsSocketRuntime>& runtime, size_t slot_idx, const std::string& color)
+{
+    const std::string normalized_color = normalize_cfs_color(color);
+    if (!runtime || normalized_color.empty() || slot_idx >= cfs_slot_count)
+        return false;
+
+    std::lock_guard<std::mutex> lock(runtime->mutex);
+    if (slot_idx >= runtime->slot_materials.size())
+        return false;
+
+    const auto& slot = runtime->slot_materials[slot_idx];
+    if (slot.material_id < 0 || slot.type.empty())
+        return false;
+
+    const json payload = cfs_build_modify_material_payload(slot, normalized_color);
+    runtime->pending_modify_materials.emplace_back(payload);
+    runtime->request_boxs_info = true;
+    return true;
+}
+
+template <typename WebsocketT>
+void cfs_socket_send_json(WebsocketT& ws, const json& payload)
+{
+    ws.write(net::buffer(payload.dump()));
+}
+
+template <typename WebsocketT>
+void cfs_socket_send_text(WebsocketT& ws, const std::string& payload)
+{
+    ws.write(net::buffer(payload));
+}
+
+void run_cfs_socket_session(const std::shared_ptr<CfsSocketRuntime>& runtime)
+{
+    auto current_host = [&]() {
+        std::lock_guard<std::mutex> lock(runtime->mutex);
+        return runtime->host;
+    };
+
+    auto current_origin = [&]() {
+        std::lock_guard<std::mutex> lock(runtime->mutex);
+        return runtime->origin;
+    };
+
+    while (!cfs_socket_should_stop(runtime)) {
+        const std::string host = current_host();
+        const std::string origin = current_origin();
+        bool session_received_payload = false;
+
+        if (host.empty())
+            break;
+
+        try {
+            BOOST_LOG_TRIVIAL(info) << "CFS socket: connecting to ws://" << host << ":9999";
+            net::io_context                              ioc;
+            tcp::resolver                                resolver{ioc};
+            websocket::stream<beast::tcp_stream>         ws{ioc};
+
+            const auto results = resolver.resolve(host, "9999");
+            ws.next_layer().expires_after(cfs_socket_timeout);
+            const auto endpoint = ws.next_layer().connect(results);
+            const auto handshake_host = host + ":" + std::to_string(endpoint.port());
+            ws.next_layer().expires_never();
+
+            ws.set_option(websocket::stream_base::decorator(
+                [origin](websocket::request_type& req)
+                {
+                    req.set(beast::http::field::user_agent, "OrcaSlicer");
+                    if (!origin.empty())
+                        req.set(beast::http::field::origin, origin);
+                }));
+            ws.handshake(handshake_host, "/");
+
+            cfs_socket_set_connected(runtime, true);
+            BOOST_LOG_TRIVIAL(info) << "CFS socket: connected to ws://" << host << ":9999";
+
+            cfs_socket_send_json(ws, json{{"ModeCode", "heart_beat"}});
+            cfs_socket_send_json(ws, json{{"method", "get"}, {"params", {{"boxsInfo", 1}}}});
+
+            auto next_poll      = std::chrono::steady_clock::now() + std::chrono::milliseconds(cfs_socket_poll_interval_ms);
+            auto next_heartbeat = std::chrono::steady_clock::now() + std::chrono::milliseconds(cfs_socket_heartbeat_ms);
+
+            while (!cfs_socket_should_stop(runtime)) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= next_heartbeat) {
+                    cfs_socket_send_json(ws, json{{"ModeCode", "heart_beat"}});
+                    next_heartbeat = now + std::chrono::milliseconds(cfs_socket_heartbeat_ms);
+                }
+
+                if (now >= next_poll || cfs_socket_consume_boxs_info_request(runtime)) {
+                    cfs_socket_send_json(ws, json{{"method", "get"}, {"params", {{"boxsInfo", 1}}}});
+                    next_poll = now + std::chrono::milliseconds(cfs_socket_poll_interval_ms);
+                }
+
+                const auto pending_modify_materials = cfs_socket_consume_pending_modify_materials(runtime);
+                for (const auto& modify_material : pending_modify_materials) {
+                    BOOST_LOG_TRIVIAL(warning) << "CFS socket: sending modifyMaterial for slot "
+                                               << modify_material.value("id", -1)
+                                               << " color=" << modify_material.value("color", "");
+                    cfs_socket_send_json(ws, json{{"method", "set"}, {"params", {{"modifyMaterial", modify_material}}}});
+                    cfs_socket_send_json(ws, json{{"method", "get"}, {"params", {{"boxsInfo", 1}}}});
+                    next_poll = std::chrono::steady_clock::now() + std::chrono::milliseconds(cfs_socket_poll_interval_ms);
+                }
+
+                beast::error_code available_ec;
+                const auto available_bytes = ws.next_layer().socket().available(available_ec);
+                if (available_ec)
+                    throw beast::system_error(available_ec);
+
+                if (available_bytes == 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(cfs_socket_idle_sleep_ms));
+                    continue;
+                }
+
+                beast::flat_buffer buffer;
+                ws.read(buffer);
+
+                const auto payload = beast::buffers_to_string(buffer.data());
+                session_received_payload = true;
+                if (payload.find("heart_beat") != std::string::npos) {
+                    cfs_socket_send_text(ws, "ok");
+                    continue;
+                }
+
+                if (payload == "ok")
+                    continue;
+
+                const auto parsed = json::parse(payload, nullptr, false);
+                if (parsed.is_discarded())
+                    continue;
+
+                std::vector<CfsSlotMaterial> slot_materials(cfs_slot_count);
+                extract_cfs_materials_from_json(parsed, slot_materials);
+                const bool has_materials = std::any_of(slot_materials.begin(), slot_materials.end(), [](const CfsSlotMaterial& slot) {
+                    return !slot.color.empty() || !slot.type.empty();
+                });
+                if (has_materials) {
+                    cfs_socket_store_materials(runtime, std::move(slot_materials));
+                    cfs_socket_set_connected(runtime, true);
+                    BOOST_LOG_TRIVIAL(info) << "CFS socket: read material info from " << host;
+                }
+            }
+
+            beast::error_code close_ec;
+            ws.close(websocket::close_code::normal, close_ec);
+        } catch (const beast::system_error& ex) {
+            const auto code = ex.code().value();
+            const bool expected_disconnect =
+                ex.code() == websocket::error::closed ||
+                ex.code() == net::error::eof ||
+                code == 995;
+            if (session_received_payload && expected_disconnect)
+                BOOST_LOG_TRIVIAL(info) << "CFS socket: session ended for " << host << " - " << ex.code().message();
+            else
+                BOOST_LOG_TRIVIAL(warning) << "CFS socket: failed for " << host << " - " << ex.what();
+        } catch (const std::exception& ex) {
+            BOOST_LOG_TRIVIAL(warning) << "CFS socket: failed for " << host << " - " << ex.what();
+        }
+
+        cfs_socket_set_connected(runtime, false);
+        if (cfs_socket_should_stop(runtime))
+            break;
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(cfs_socket_retry_ms));
+    }
+}
+
 #ifdef __WXGTK__
 wxString sanitize_window_layout_for_wayland(const wxString& layout, bool* removed_floating_state = nullptr)
 {
@@ -492,6 +1057,7 @@ struct Sidebar::priv
     //Button *btn_sync_printer;
     std::shared_ptr<int> counter_sync_printer = std::make_shared<int>();
     wxTimer *            timer_sync_printer = new wxTimer();
+    wxTimer *            timer_cfs_sync = new wxTimer();
     // Printer - ams
     ExtruderGroup *left_extruder = nullptr;
     ExtruderGroup *right_extruder = nullptr;
@@ -504,6 +1070,8 @@ struct Sidebar::priv
 
     PlaterPresetComboBox *combo_print = nullptr;
     std::vector<PlaterPresetComboBox*> combos_filament;
+    std::vector<wxPanel*>              cfs_filament_badge_panels;
+    std::vector<Label*>                cfs_filament_badge_labels;
     int editing_filament = -1;
     wxBoxSizer *sizer_filaments = nullptr;
 
@@ -519,10 +1087,12 @@ struct Sidebar::priv
     wxStaticText* m_staticText_filament_settings;
     ScalableButton *  m_bpButton_add_filament;
     ScalableButton *  m_bpButton_del_filament;
+    Button *          m_bpButton_cfs_filament = nullptr;
     ScalableButton *  m_bpButton_ams_filament;
     ScalableButton *  m_bpButton_set_filament;
     int m_menu_filament_id = -1;
     wxScrolledWindow* m_panel_filament_content;
+    HyperLink*        m_link_cfs_config = nullptr;
     wxScrolledWindow* m_scrolledWindow_filament_content;
     wxStaticLine* m_staticline2;
     wxPanel* m_panel_project_title;
@@ -554,6 +1124,15 @@ struct Sidebar::priv
     bool                    is_switching_diameter{false};
     Search::OptionsSearcher     searcher;
     std::string ams_list_device;
+    bool                    cfs_socket_connected{false};
+    bool                    cfs_auto_sync_enabled{false};
+    std::string             cfs_socket_host;
+    std::string             cfs_socket_origin;
+    std::shared_ptr<CfsSocketRuntime> cfs_socket_runtime;
+    std::thread             cfs_socket_thread;
+    size_t                  cfs_last_applied_generation{0};
+    std::unordered_set<int> cfs_ignore_outbound_color_sync_slots;
+    std::unordered_map<int, CfsPendingLocalOverride> cfs_pending_local_overrides;
 
     priv(Plater *plater) : plater(plater) {}
     ~priv();
@@ -659,6 +1238,25 @@ void Sidebar::priv::flush_printer_sync(bool restart)
 
 Sidebar::priv::~priv()
 {
+    if (cfs_socket_runtime) {
+        {
+            std::lock_guard<std::mutex> lock(cfs_socket_runtime->mutex);
+            cfs_socket_runtime->stop_requested = true;
+        }
+        if (cfs_socket_thread.joinable())
+            cfs_socket_thread.join();
+        cfs_socket_runtime.reset();
+    }
+    if (timer_sync_printer != nullptr) {
+        timer_sync_printer->Stop();
+        delete timer_sync_printer;
+        timer_sync_printer = nullptr;
+    }
+    if (timer_cfs_sync != nullptr) {
+        timer_cfs_sync->Stop();
+        delete timer_cfs_sync;
+        timer_cfs_sync = nullptr;
+    }
     // BBS
     //delete object_manipulation;
     delete object_settings;
@@ -2045,6 +2643,9 @@ Sidebar::Sidebar(Plater *parent)
         p->timer_sync_printer->Bind(wxEVT_TIMER, [this] (wxTimerEvent & e) {
             p->flush_printer_sync();
         });
+        p->timer_cfs_sync->Bind(wxEVT_TIMER, [this](wxTimerEvent&) {
+            handle_cfs_auto_sync_tick();
+        });
        
 
         p->left_extruder  = new ExtruderGroup(p->m_panel_printer_content, 0, _L("Left Nozzle"));
@@ -2107,6 +2708,17 @@ Sidebar::Sidebar(Plater *parent)
     // BBS
     // add wiping dialog
     //wiping_dialog_button->SetFont(wxGetApp().normal_font());
+    auto cfs_btn = new Button(p->m_panel_filament_title, "CFS");
+    cfs_btn->SetStyle(ButtonStyle::Regular, ButtonType::Compact);
+    cfs_btn->SetToolTip(_L("Synchronize filament colors and fixed PLA/PETG presets from CFS"));
+    cfs_btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+        BOOST_LOG_TRIVIAL(warning) << "CFS socket: sync button clicked";
+        sync_cfs_colors();
+    });
+    p->m_bpButton_cfs_filament = cfs_btn;
+    bSizer39->Add(cfs_btn, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(4));
+    bSizer39->Hide(cfs_btn);
+
     p->m_flushing_volume_btn = new Button(p->m_panel_filament_title, _L("Flushing volumes"));
     p->m_flushing_volume_btn->SetStyle(ButtonStyle::Confirm, ButtonType::Compact);
     p->m_flushing_volume_btn->SetId(wxID_RESET);
@@ -2168,6 +2780,14 @@ Sidebar::Sidebar(Plater *parent)
 
     bSizer39->Add(set_btn, 0, wxALIGN_CENTER | wxLEFT, FromDIP(SidebarProps::WideSpacing()));
     bSizer39->AddSpacer(FromDIP(SidebarProps::TitlebarMargin()));
+
+    p->m_link_cfs_config = new HyperLink(p->scrolled, _L("Configure CFS"));
+    p->m_link_cfs_config->SetFont(Label::Body_12);
+    p->m_link_cfs_config->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent&) {
+        open_cfs_config_dialog();
+    });
+    scrolled_sizer->Add(p->m_link_cfs_config, 0, wxLEFT | wxRIGHT | wxTOP, FromDIP(8));
+    p->m_link_cfs_config->Hide();
 
     // add filament content
     p->m_panel_filament_content = new wxScrolledWindow( p->scrolled, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxTAB_TRAVERSAL );
@@ -2292,9 +2912,19 @@ Sidebar::Sidebar(Plater *parent)
     auto *sizer = new wxBoxSizer(wxVERTICAL);
     sizer->Add(p->scrolled, 1, wxEXPAND);
     SetSizer(sizer);
+    p->cfs_auto_sync_enabled = is_cfs_auto_sync_enabled();
+    refresh_cfs_sync_state(true);
+    update_cfs_auto_sync_ui();
+    p->timer_cfs_sync->Start(cfs_socket_poll_interval_ms);
 }
 
-Sidebar::~Sidebar() {}
+Sidebar::~Sidebar()
+{
+    if (p && p->timer_cfs_sync)
+        p->timer_cfs_sync->Stop();
+    if (p)
+        stop_cfs_socket_session();
+}
 
 void Sidebar::on_enter_image_printer_bed(wxMouseEvent &evt) {
     //p->image_printer_bed->Bind(wxEVT_LEAVE_WINDOW, &Sidebar::on_leave_image_printer_bed, this);
@@ -2366,6 +2996,26 @@ void Sidebar::init_filament_combo(PlaterPresetComboBox **combo, const int filame
     combo_and_btn_sizer->Add((*combo)->clr_picker, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(SidebarProps::ElementSpacing()) - FromDIP(2)); // ElementSpacing - 2 (from combo box))
     combo_and_btn_sizer->Add(*combo, 1, wxALL | wxEXPAND, FromDIP(2))->SetMinSize({-1, FromDIP(30)});
 
+    if (static_cast<size_t>(filament_idx) >= p->cfs_filament_badge_panels.size()) {
+        p->cfs_filament_badge_panels.resize(filament_idx + 1, nullptr);
+        p->cfs_filament_badge_labels.resize(filament_idx + 1, nullptr);
+    }
+
+    auto* cfs_badge_panel = new wxPanel(p->m_panel_filament_content, wxID_ANY);
+    cfs_badge_panel->SetBackgroundColour(wxColour("#009688"));
+    auto* cfs_badge_sizer = new wxBoxSizer(wxHORIZONTAL);
+    auto* cfs_badge_label = new Label(cfs_badge_panel, "CFS");
+    cfs_badge_label->SetFont(Label::Body_10);
+    cfs_badge_label->SetForegroundColour(*wxWHITE);
+    cfs_badge_label->SetBackgroundColour(wxColour("#009688"));
+    cfs_badge_sizer->Add(cfs_badge_label, 0, wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, FromDIP(4));
+    cfs_badge_panel->SetSizer(cfs_badge_sizer);
+    cfs_badge_panel->Hide();
+
+    p->cfs_filament_badge_panels[filament_idx] = cfs_badge_panel;
+    p->cfs_filament_badge_labels[filament_idx] = cfs_badge_label;
+    combo_and_btn_sizer->Add(cfs_badge_panel, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(4));
+
     /* BBS hide del_btn
     ScalableButton* del_btn = new ScalableButton(p->m_panel_filament_content, wxID_ANY, "delete_filament");
     del_btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent& e){
@@ -2417,8 +3067,17 @@ void Sidebar::remove_unused_filament_combos(const size_t current_extruder_count)
         const int last = p->combos_filament.size() - 1;
         auto sizer_filaments = this->p->sizer_filaments->GetItem(last % 2)->GetSizer();
         sizer_filaments->Remove(last / 2);
+        if (last < static_cast<int>(p->cfs_filament_badge_panels.size()) && p->cfs_filament_badge_panels[last]) {
+            p->cfs_filament_badge_panels[last]->Destroy();
+            p->cfs_filament_badge_panels[last] = nullptr;
+            p->cfs_filament_badge_labels[last] = nullptr;
+        }
         (*p->combos_filament[last]).Destroy();
         p->combos_filament.pop_back();
+        if (last < static_cast<int>(p->cfs_filament_badge_panels.size())) {
+            p->cfs_filament_badge_panels.pop_back();
+            p->cfs_filament_badge_labels.pop_back();
+        }
     }
     // BBS:  filament double columns
     auto sizer_filaments0 = this->p->sizer_filaments->GetItem((size_t)0)->GetSizer();
@@ -2894,10 +3553,12 @@ void Sidebar::msw_rescale()
     p->m_filament_icon->msw_rescale();
     p->m_bpButton_add_filament->msw_rescale();
     p->m_bpButton_del_filament->msw_rescale();
+    p->m_bpButton_cfs_filament->Rescale();
     p->m_bpButton_ams_filament->msw_rescale();
     p->m_bpButton_set_filament->msw_rescale();
     p->m_flushing_volume_btn->Rescale();
     set_flushing_volume_warning(is_flush_config_modified()); // ORCA reapply appearance
+    update_cfs_auto_sync_ui();
 
     //BBS
     p->left_extruder->Rescale();
@@ -2979,10 +3640,12 @@ void Sidebar::sys_color_changed()
     p->m_filament_icon->msw_rescale();
     p->m_bpButton_add_filament->msw_rescale();
     p->m_bpButton_del_filament->msw_rescale();
+    p->m_bpButton_cfs_filament->Rescale();
     p->m_bpButton_ams_filament->msw_rescale();
     p->m_bpButton_set_filament->msw_rescale();
     p->m_flushing_volume_btn->Rescale();
     set_flushing_volume_warning(is_flush_config_modified()); // ORCA reapply appearance
+    update_cfs_auto_sync_ui();
 
     // BBS
 #if 0
@@ -3105,6 +3768,7 @@ void Sidebar::on_filament_count_change(size_t num_filaments)
 
     update_filaments_area_height();  // ORCA
 
+    update_cfs_filament_badges();
     Layout();
     p->m_panel_filament_title->Refresh();
     update_ui_from_settings();
@@ -3130,8 +3794,17 @@ void Sidebar::on_filaments_delete(size_t filament_id)
         sizer_filaments->Remove(last / 2);
 
         PlaterPresetComboBox* to_delete_combox = p->combos_filament[filament_id];
+        if (last < static_cast<int>(p->cfs_filament_badge_panels.size()) && p->cfs_filament_badge_panels[last]) {
+            p->cfs_filament_badge_panels[last]->Destroy();
+            p->cfs_filament_badge_panels[last] = nullptr;
+            p->cfs_filament_badge_labels[last] = nullptr;
+        }
         (*p->combos_filament[last]).Destroy();
         p->combos_filament.pop_back();
+        if (last < static_cast<int>(p->cfs_filament_badge_panels.size())) {
+            p->cfs_filament_badge_panels.pop_back();
+            p->cfs_filament_badge_labels.pop_back();
+        }
 
         // BBS:  filament double columns
         auto sizer_filaments0 = this->p->sizer_filaments->GetItem((size_t) 0)->GetSizer();
@@ -3165,6 +3838,7 @@ void Sidebar::on_filaments_delete(size_t filament_id)
 
     update_filaments_area_height(); // ORCA
 
+    update_cfs_filament_badges();
     Layout();
     p->m_panel_filament_title->Refresh();
     update_ui_from_settings();
@@ -3463,6 +4137,862 @@ void Sidebar::load_ams_list(MachineObject* obj)
     }
 
     p->combo_printer->update();
+    refresh_cfs_sync_state(true);
+}
+
+std::string Sidebar::get_cfs_socket_host() const
+{
+    const auto& cfg = wxGetApp().preset_bundle->printers.get_edited_preset().config;
+    wxString url = cfg.opt_string("print_host_webui").empty() ? cfg.opt_string("print_host") : cfg.opt_string("print_host_webui");
+    const auto host = extract_cfs_host_from_print_host(url);
+    BOOST_LOG_TRIVIAL(info) << "CFS socket: print host '" << into_u8(url) << "' resolved to '" << host << "'";
+    return host;
+}
+
+bool Sidebar::is_cfs_supported_printer() const
+{
+    PresetBundle* preset_bundle = wxGetApp().preset_bundle;
+    if (!preset_bundle)
+        return false;
+
+    auto& preset = preset_bundle->printers.get_edited_preset();
+    const std::string printer_type  = preset.get_printer_type(preset_bundle);
+    const std::string printer_model = preset.config.opt_string("printer_model");
+
+    BOOST_LOG_TRIVIAL(warning) << "CFS socket: printer support check type='" << printer_type
+                               << "' model='" << printer_model
+                               << "' preset='" << preset.name << "'";
+
+    return printer_type.find("K1") != std::string::npos
+        || printer_model.find("K1") != std::string::npos;
+}
+
+std::string Sidebar::get_cfs_socket_origin() const
+{
+    const auto& cfg = wxGetApp().preset_bundle->printers.get_edited_preset().config;
+    wxString url = cfg.opt_string("print_host_webui").empty() ? cfg.opt_string("print_host") : cfg.opt_string("print_host_webui");
+    url.Trim(true);
+    url.Trim(false);
+
+    if (url.empty())
+        return {};
+
+    std::string origin = into_u8(url);
+    boost::algorithm::trim(origin);
+
+    if (!boost::algorithm::istarts_with(origin, "http://") && !boost::algorithm::istarts_with(origin, "https://"))
+        origin = "http://" + origin;
+
+    if (const auto slash_pos = origin.find('/', origin.find("://") + 3); slash_pos != std::string::npos)
+        origin = origin.substr(0, slash_pos);
+
+    BOOST_LOG_TRIVIAL(info) << "CFS socket: using origin '" << origin << "'";
+    return origin;
+}
+
+bool Sidebar::is_cfs_auto_sync_enabled() const
+{
+    return wxGetApp().app_config->get(cfs_auto_sync_config_key) == "1";
+}
+
+bool Sidebar::is_cfs_auto_apply_preset_enabled() const
+{
+    const std::string value = wxGetApp().app_config->get(cfs_auto_apply_preset_config_key);
+    return value.empty() || value == "1";
+}
+
+std::string Sidebar::get_cfs_preset_mapping_for_type(const std::string& material_type) const
+{
+    const std::string config_key = cfs_material_type_config_key(material_type);
+    std::string value = wxGetApp().app_config->get(config_key);
+    boost::algorithm::trim(value);
+    if (value.empty())
+        value = cfs_default_preset_mapping(material_type);
+    return value;
+}
+
+std::string Sidebar::get_cfs_material_type_for_preset(const std::string& preset_name) const
+{
+    const std::string normalized_preset_name = Preset::remove_suffix_modified(preset_name);
+    if (normalized_preset_name.empty())
+        return {};
+
+    for (const auto& material_type : cfs_supported_material_types()) {
+        const std::string mapped_preset = get_cfs_preset_mapping_for_type(material_type);
+        if (!mapped_preset.empty() && normalized_preset_name == mapped_preset)
+            return material_type;
+    }
+
+    return {};
+}
+
+void Sidebar::set_cfs_auto_sync_enabled(bool enabled)
+{
+    p->cfs_auto_sync_enabled = enabled;
+    wxGetApp().app_config->set(cfs_auto_sync_config_key, enabled ? "1" : "0");
+    wxGetApp().app_config->save();
+}
+
+void Sidebar::update_cfs_config_ui()
+{
+    if (!p->m_link_cfs_config)
+        return;
+
+    p->m_link_cfs_config->SetLabel(_L("Configure CFS"));
+    p->m_link_cfs_config->SetToolTip(_L("Choose whether CFS should also switch filament presets and which preset each type should use."));
+}
+
+void Sidebar::open_cfs_config_dialog()
+{
+    struct CfsConfigDialog : DPIDialog {
+        using DPIDialog::DPIDialog;
+        void on_dpi_changed(const wxRect&) override {}
+    };
+
+    CfsConfigDialog dlg(this, wxID_ANY, _L("CFS Settings"), wxDefaultPosition, wxDefaultSize, wxCAPTION | wxCLOSE_BOX);
+    dlg.SetBackgroundColour(*wxWHITE);
+
+    const auto collect_preset_names = []() {
+        wxArrayString choices;
+        std::unordered_set<std::string> seen;
+        const auto& presets = wxGetApp().preset_bundle->filaments.get_presets();
+        for (const auto& preset : presets) {
+            if (preset.is_default)
+                continue;
+            if (!seen.insert(preset.name).second)
+                continue;
+            choices.Add(from_u8(preset.name));
+        }
+        return choices;
+    };
+
+    const auto ensure_choice = [](wxArrayString& choices, const std::string& current_value) {
+        if (current_value.empty())
+            return;
+        const wxString wx_value = from_u8(current_value);
+        if (choices.Index(wx_value) == wxNOT_FOUND)
+            choices.Add(wx_value);
+    };
+
+    wxArrayString preset_choices = collect_preset_names();
+    const auto material_types = cfs_supported_material_types();
+    for (const auto& material_type : material_types)
+        ensure_choice(preset_choices, get_cfs_preset_mapping_for_type(material_type));
+
+    auto* root = new wxBoxSizer(wxVERTICAL);
+    root->SetMinSize(wxSize(dlg.FromDIP(420), -1));
+
+    auto* desc = new Label(&dlg, Label::Body_13, _L("Configure how CFS filament types should map to Orca filament presets."));
+    desc->SetForegroundColour(StateColor::darkModeColorFor("#262E30"));
+    desc->Wrap(dlg.FromDIP(420));
+    root->Add(desc, 0, wxALL, dlg.FromDIP(12));
+
+    auto* auto_row = new wxBoxSizer(wxHORIZONTAL);
+    auto* auto_checkbox = new ::CheckBox(&dlg);
+    auto_checkbox->SetValue(is_cfs_auto_apply_preset_enabled());
+    auto* auto_label = new Label(&dlg, Label::Body_13, _L("Automatically switch filament presets"), LB_PROPAGATE_MOUSE_EVENT);
+    auto_label->Bind(wxEVT_LEFT_DOWN, [auto_checkbox](wxMouseEvent&) {
+        auto_checkbox->SetValue(!auto_checkbox->GetValue());
+    });
+    auto_row->Add(auto_checkbox, 0, wxALIGN_CENTER_VERTICAL);
+    auto_row->AddSpacer(FromDIP(6));
+    auto_row->Add(auto_label, 0, wxALIGN_CENTER_VERTICAL);
+    root->Add(auto_row, 0, wxLEFT | wxRIGHT | wxBOTTOM, dlg.FromDIP(12));
+
+    auto* scrolled = new wxScrolledWindow(&dlg, wxID_ANY, wxDefaultPosition, wxSize(-1, dlg.FromDIP(320)), wxVSCROLL);
+    scrolled->SetScrollRate(0, dlg.FromDIP(12));
+
+    auto make_mapping_row = [&dlg, scrolled, &preset_choices](const wxString& type_label, const std::string& selected_name) {
+        auto* row = new wxBoxSizer(wxHORIZONTAL);
+        auto* label = new Label(scrolled, Label::Body_12, type_label);
+        label->SetForegroundColour(StateColor::darkModeColorFor("#6B6A6A"));
+        label->SetMinSize(wxSize(dlg.FromDIP(90), -1));
+        auto* combo = new ::ComboBox(scrolled, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(dlg.FromDIP(220), -1), 0, nullptr, wxCB_READONLY);
+        for (const auto& choice : preset_choices)
+            combo->Append(choice);
+        const int selected_index = combo->FindString(from_u8(selected_name));
+        combo->SetSelection(selected_index == wxNOT_FOUND ? 0 : selected_index);
+        row->Add(label, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, dlg.FromDIP(10));
+        row->Add(combo, 1, wxEXPAND);
+        return std::pair<wxBoxSizer*, ::ComboBox*>(row, combo);
+    };
+
+    auto* mappings_sizer = new wxBoxSizer(wxVERTICAL);
+    std::vector<std::pair<std::string, ::ComboBox*>> mapping_controls;
+    mapping_controls.reserve(material_types.size());
+    for (const auto& material_type : material_types) {
+        auto [row, combo] = make_mapping_row(from_u8(material_type), get_cfs_preset_mapping_for_type(material_type));
+        mappings_sizer->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, dlg.FromDIP(10));
+        mapping_controls.emplace_back(material_type, combo);
+    }
+    scrolled->SetSizer(mappings_sizer);
+    mappings_sizer->FitInside(scrolled);
+    root->Add(scrolled, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, dlg.FromDIP(12));
+
+    const auto update_combo_state = [auto_checkbox, mapping_controls]() {
+        const bool enabled = auto_checkbox->GetValue();
+        for (const auto& [material_type, combo] : mapping_controls) {
+            (void) material_type;
+            combo->Enable(enabled);
+        }
+    };
+    update_combo_state();
+    auto_checkbox->Bind(wxEVT_TOGGLEBUTTON, [update_combo_state](wxCommandEvent&) {
+        update_combo_state();
+    });
+
+    auto* button_row = new wxBoxSizer(wxHORIZONTAL);
+    button_row->AddStretchSpacer(1);
+    auto* ok_btn = new Button(&dlg, _L("OK"));
+    ok_btn->SetStyle(ButtonStyle::Confirm, ButtonType::Choice);
+    auto* cancel_btn = new Button(&dlg, _L("Cancel"));
+    cancel_btn->SetStyle(ButtonStyle::Regular, ButtonType::Choice);
+    button_row->Add(ok_btn, 0, wxRIGHT, dlg.FromDIP(12));
+    button_row->Add(cancel_btn, 0);
+    root->Add(button_row, 0, wxEXPAND | wxALL, dlg.FromDIP(12));
+
+    ok_btn->Bind(wxEVT_BUTTON, [&dlg](wxCommandEvent&) { dlg.EndModal(wxID_OK); });
+    cancel_btn->Bind(wxEVT_BUTTON, [&dlg](wxCommandEvent&) { dlg.EndModal(wxID_CANCEL); });
+
+    dlg.SetSizer(root);
+    dlg.Layout();
+    root->Fit(&dlg);
+    wxGetApp().UpdateDlgDarkUI(&dlg);
+
+    if (dlg.ShowModal() != wxID_OK)
+        return;
+
+    wxGetApp().app_config->set(cfs_auto_apply_preset_config_key, auto_checkbox->GetValue() ? "1" : "0");
+    for (const auto& [material_type, combo] : mapping_controls)
+        wxGetApp().app_config->set(cfs_material_type_config_key(material_type), into_u8(combo->GetValue()));
+    wxGetApp().app_config->save();
+    update_cfs_config_ui();
+}
+
+void Sidebar::update_cfs_filament_badges()
+{
+    const bool show_badges = p->cfs_auto_sync_enabled;
+    bool live_connected = false;
+    if (p->cfs_socket_runtime) {
+        std::lock_guard<std::mutex> lock(p->cfs_socket_runtime->mutex);
+        live_connected = p->cfs_socket_runtime->connected;
+    }
+
+    const wxColour badge_color = (p->cfs_auto_sync_enabled && !live_connected)
+        ? wxColour("#D32F2F")
+        : wxColour("#009688");
+    const size_t count = std::min(p->combos_filament.size(), p->cfs_filament_badge_panels.size());
+    for (size_t idx = 0; idx < count; ++idx) {
+        if (!p->cfs_filament_badge_panels[idx])
+            continue;
+        p->cfs_filament_badge_panels[idx]->SetBackgroundColour(badge_color);
+        if (idx < p->cfs_filament_badge_labels.size() && p->cfs_filament_badge_labels[idx])
+            p->cfs_filament_badge_labels[idx]->SetBackgroundColour(badge_color);
+        p->cfs_filament_badge_panels[idx]->SetToolTip(
+            live_connected
+                ? _L("CFS automatic synchronization is active for this filament.")
+                : _L("CFS automatic synchronization is active, but the printer is offline."));
+        p->cfs_filament_badge_panels[idx]->Show(show_badges);
+        p->cfs_filament_badge_panels[idx]->Refresh();
+    }
+
+    if (p->m_panel_filament_content)
+        p->m_panel_filament_content->Layout();
+    Layout();
+}
+
+void Sidebar::update_cfs_auto_sync_ui()
+{
+    bool live_connected = false;
+    if (p->cfs_socket_runtime) {
+        std::lock_guard<std::mutex> lock(p->cfs_socket_runtime->mutex);
+        live_connected = p->cfs_socket_runtime->connected;
+    }
+
+    if (p->m_bpButton_cfs_filament) {
+        auto make_state_color = [](const wxColour& disabled,
+                                   const wxColour& pressed,
+                                   const wxColour& hovered,
+                                   const wxColour& normal,
+                                   const wxColour& checked) {
+            return StateColor(
+                std::make_pair(disabled, (int) StateColor::Disabled),
+                std::make_pair(pressed, (int) StateColor::Pressed),
+                std::make_pair(pressed, (int) (StateColor::Pressed | StateColor::Checked)),
+                std::make_pair(hovered, (int) StateColor::Hovered),
+                std::make_pair(hovered, (int) (StateColor::Hovered | StateColor::Checked)),
+                std::make_pair(checked, (int) StateColor::Checked),
+                std::make_pair(normal, (int) StateColor::Normal),
+                std::make_pair(normal, (int) StateColor::Enabled)
+            );
+        };
+
+        p->m_bpButton_cfs_filament->SetLabel("CFS");
+        if (!live_connected) {
+            p->m_bpButton_cfs_filament->SetStyle(ButtonStyle::Regular, ButtonType::Compact);
+            p->m_bpButton_cfs_filament->SetToolTip(
+                p->cfs_auto_sync_enabled
+                    ? _L("Automatic CFS synchronization is enabled, but the printer is offline.")
+                    : _L("CFS synchronization is disabled, and the printer is offline."));
+        } else if (p->cfs_auto_sync_enabled) {
+            p->m_bpButton_cfs_filament->SetStyle(ButtonStyle::Confirm, ButtonType::Compact);
+            p->m_bpButton_cfs_filament->SetToolTip(_L("Disable automatic CFS filament synchronization"));
+        } else {
+            p->m_bpButton_cfs_filament->SetStyle(ButtonStyle::Regular, ButtonType::Compact);
+            p->m_bpButton_cfs_filament->SetToolTip(_L("Enable automatic CFS filament synchronization"));
+        }
+        p->m_bpButton_cfs_filament->Rescale();
+        if (!live_connected) {
+            p->m_bpButton_cfs_filament->SetValue(false);
+            p->m_bpButton_cfs_filament->SetBackgroundColor(make_state_color(
+                wxColour("#D32F2F"),
+                wxColour("#A91E1E"),
+                wxColour("#E14747"),
+                wxColour("#D32F2F"),
+                wxColour("#D32F2F")));
+            p->m_bpButton_cfs_filament->SetBorderColor(make_state_color(
+                wxColour("#B71C1C"),
+                wxColour("#8E1616"),
+                wxColour("#B71C1C"),
+                wxColour("#B71C1C"),
+                wxColour("#B71C1C")));
+            p->m_bpButton_cfs_filament->SetTextColor(make_state_color(
+                wxColour("#FFFFFF"),
+                wxColour("#FFFFFF"),
+                wxColour("#FFFFFF"),
+                wxColour("#FFFFFF"),
+                wxColour("#FFFFFF")));
+        } else {
+            p->m_bpButton_cfs_filament->SetValue(p->cfs_auto_sync_enabled);
+        }
+        p->m_bpButton_cfs_filament->Refresh();
+        p->m_bpButton_cfs_filament->Update();
+    }
+
+    update_cfs_config_ui();
+    update_cfs_filament_badges();
+    apply_cfs_sync_button_visibility();
+}
+
+bool Sidebar::apply_cfs_colors_to_ui(const std::vector<std::string>& colors, bool force_reapply, const char* context)
+{
+    DynamicPrintConfig& project_config = wxGetApp().preset_bundle->project_config;
+    auto* color_opt = project_config.option<ConfigOptionStrings>("filament_colour");
+    if (!color_opt)
+        return false;
+
+    color_opt->values.resize(std::max(color_opt->values.size(), p->combos_filament.size()), "#26A69A");
+
+    const size_t color_count = std::min({color_opt->values.size(), p->combos_filament.size(), colors.size()});
+    if (color_count == 0)
+        return false;
+
+    size_t applied_slots = 0;
+    size_t changed_slots = 0;
+    for (size_t idx = 0; idx < color_count; ++idx) {
+        if (colors[idx].empty())
+            continue;
+
+        const auto previous_color = color_opt->values[idx];
+        const bool changed = previous_color != colors[idx];
+        if (!force_reapply && !changed)
+            continue;
+
+        BOOST_LOG_TRIVIAL(warning) << "CFS socket: " << context << " applying color slot " << idx
+                                   << " old=" << previous_color
+                                   << " new=" << colors[idx];
+
+        p->combos_filament[idx]->sync_colour_config({colors[idx]}, false);
+
+        p->cfs_ignore_outbound_color_sync_slots.insert(static_cast<int>(idx));
+        wxCommandEvent* evt = new wxCommandEvent(EVT_FILAMENT_COLOR_CHANGED);
+        evt->SetInt(static_cast<int>(idx));
+        wxQueueEvent(wxGetApp().plater(), evt);
+
+        ++applied_slots;
+        if (changed)
+            ++changed_slots;
+    }
+
+    if (applied_slots == 0) {
+        BOOST_LOG_TRIVIAL(warning) << "CFS socket: " << context << " found no color updates to apply";
+        update_cfs_filament_badges();
+        return true;
+    }
+
+    for (size_t idx = 0; idx < color_count; ++idx) {
+        if (colors[idx].empty())
+            continue;
+        p->combos_filament[idx]->SetToolTip(_L("Filament color synchronized from CFS."));
+        if (wxGetApp().app_config->get("auto_calculate_flush") != "disabled")
+            auto_calc_flushing_volumes(static_cast<int>(idx));
+    }
+
+    obj_list()->update_filament_colors();
+    update_dynamic_filament_list();
+    update_ui_from_settings();
+    p->plater->update();
+    update_cfs_filament_badges();
+    BOOST_LOG_TRIVIAL(warning) << "CFS socket: " << context << " applied " << applied_slots
+                               << " slot(s), changed " << changed_slots << " slot value(s)";
+    return true;
+}
+
+bool Sidebar::apply_cfs_presets_to_ui(const std::vector<std::string>& material_types, bool force_reapply, const char* context)
+{
+    if (!is_cfs_auto_apply_preset_enabled()) {
+        BOOST_LOG_TRIVIAL(warning) << "CFS socket: " << context << " skipped preset sync because automatic preset mapping is disabled";
+        return true;
+    }
+
+    auto* preset_bundle = wxGetApp().preset_bundle;
+    auto& filament_presets = preset_bundle->filament_presets;
+    const size_t slot_count = std::min({material_types.size(), filament_presets.size(), p->combos_filament.size()});
+    if (slot_count == 0)
+        return false;
+
+    size_t applied_slots = 0;
+    size_t changed_slots = 0;
+    for (size_t idx = 0; idx < slot_count; ++idx) {
+        const std::string target_preset = get_cfs_preset_mapping_for_type(material_types[idx]);
+        if (target_preset.empty())
+            continue;
+
+        const auto current_preset = Preset::remove_suffix_modified(filament_presets[idx]);
+        const bool changed = current_preset != target_preset;
+        if (!force_reapply && !changed)
+            continue;
+
+        if (!preset_bundle->filaments.find_preset(target_preset, false)) {
+            BOOST_LOG_TRIVIAL(warning) << "CFS socket: " << context
+                                       << " missing preset '" << target_preset
+                                       << "' for slot " << idx
+                                       << " type=" << material_types[idx];
+            continue;
+        }
+
+        BOOST_LOG_TRIVIAL(warning) << "CFS socket: " << context
+                                   << " applying preset slot " << idx
+                                   << " type=" << material_types[idx]
+                                   << " old=" << current_preset
+                                   << " new=" << target_preset;
+
+        preset_bundle->set_filament_preset(idx, target_preset);
+        ++applied_slots;
+        if (changed)
+            ++changed_slots;
+    }
+
+    if (applied_slots == 0) {
+        BOOST_LOG_TRIVIAL(warning) << "CFS socket: " << context << " found no preset updates to apply";
+        return true;
+    }
+
+    preset_bundle->export_selections(*wxGetApp().app_config);
+    wxGetApp().plater()->update_filament_colors_in_full_config();
+    for (auto* combo : p->combos_filament) {
+        if (combo)
+            combo->update();
+    }
+    update_dynamic_filament_list();
+    update_ui_from_settings();
+    p->plater->update();
+
+    BOOST_LOG_TRIVIAL(warning) << "CFS socket: " << context << " applied " << applied_slots
+                               << " preset slot(s), changed " << changed_slots << " preset value(s)";
+    return true;
+}
+
+bool Sidebar::apply_cfs_materials_to_ui(const std::vector<std::string>& colors, const std::vector<std::string>& material_types, bool force_reapply, const char* context)
+{
+    const bool presets_applied = apply_cfs_presets_to_ui(material_types, force_reapply, context);
+    const bool colors_applied  = apply_cfs_colors_to_ui(colors, force_reapply, context);
+    return presets_applied || colors_applied;
+}
+
+void Sidebar::handle_cfs_auto_sync_tick()
+{
+    refresh_cfs_sync_state();
+
+    if (!p->cfs_auto_sync_enabled || !p->cfs_socket_runtime)
+        return;
+
+    std::vector<std::string> colors;
+    std::vector<std::string> material_types;
+    size_t generation = 0;
+    {
+        std::lock_guard<std::mutex> lock(p->cfs_socket_runtime->mutex);
+        colors = p->cfs_socket_runtime->colors;
+        material_types = p->cfs_socket_runtime->material_types;
+        generation = p->cfs_socket_runtime->colors_generation;
+    }
+
+    const bool has_colors = std::any_of(colors.begin(), colors.end(), [](const std::string& color) { return !color.empty(); });
+    const bool has_types  = std::any_of(material_types.begin(), material_types.end(), [](const std::string& type) { return !type.empty(); });
+    if ((!has_colors && !has_types) || generation == 0 || generation == p->cfs_last_applied_generation)
+        return;
+
+    const auto now = std::chrono::steady_clock::now();
+    for (size_t idx = 0; idx < std::min(colors.size(), material_types.size()); ++idx) {
+        auto pending_it = p->cfs_pending_local_overrides.find(static_cast<int>(idx));
+        if (pending_it == p->cfs_pending_local_overrides.end())
+            continue;
+
+        const auto age = now - pending_it->second.created_at;
+        if (age > cfs_socket_recent_success_window) {
+            BOOST_LOG_TRIVIAL(warning) << "CFS socket: cleared stale local override guard for slot " << idx;
+            p->cfs_pending_local_overrides.erase(pending_it);
+            continue;
+        }
+
+        const std::string incoming_color = normalize_cfs_color(colors[idx]);
+        const std::string incoming_type  = normalize_cfs_material_type(material_types[idx]);
+        const bool color_matches = pending_it->second.color.empty() || incoming_color == pending_it->second.color;
+        const bool type_matches  = pending_it->second.material_type.empty() || incoming_type == pending_it->second.material_type;
+
+        if (color_matches && type_matches) {
+            BOOST_LOG_TRIVIAL(warning) << "CFS socket: local override confirmed for slot " << idx
+                                       << " color=" << incoming_color
+                                       << " type=" << incoming_type;
+            p->cfs_pending_local_overrides.erase(pending_it);
+            continue;
+        }
+
+        BOOST_LOG_TRIVIAL(warning) << "CFS socket: skipped stale inbound update for slot " << idx
+                                   << " while waiting local override confirmation"
+                                   << " expected_color=" << pending_it->second.color
+                                   << " expected_type=" << pending_it->second.material_type
+                                   << " incoming_color=" << incoming_color
+                                   << " incoming_type=" << incoming_type;
+        colors[idx].clear();
+        material_types[idx].clear();
+    }
+
+    const bool has_filtered_colors = std::any_of(colors.begin(), colors.end(), [](const std::string& color) { return !color.empty(); });
+    const bool has_filtered_types  = std::any_of(material_types.begin(), material_types.end(), [](const std::string& type) { return !type.empty(); });
+    if (!has_filtered_colors && !has_filtered_types)
+        return;
+
+    BOOST_LOG_TRIVIAL(warning) << "CFS socket: auto sync tick received colors=" << colors.size()
+                               << " material_types=" << material_types.size()
+                               << " generation=" << generation;
+    if (apply_cfs_materials_to_ui(colors, material_types, false, "auto color sync")) {
+        p->cfs_last_applied_generation = generation;
+        update_cfs_auto_sync_ui();
+    }
+}
+
+void Sidebar::apply_cfs_sync_button_visibility()
+{
+    if (!p->m_bpButton_cfs_filament)
+        return;
+
+    const bool should_show = is_cfs_supported_printer() && (!get_cfs_socket_host().empty() || p->cfs_auto_sync_enabled);
+    if (auto* sizer = p->m_panel_filament_title ? p->m_panel_filament_title->GetSizer() : nullptr)
+        sizer->Show(p->m_bpButton_cfs_filament, should_show);
+    else
+        p->m_bpButton_cfs_filament->Show(should_show);
+
+    if (p->m_link_cfs_config)
+        p->m_link_cfs_config->Show(should_show);
+
+    p->m_panel_filament_title->Layout();
+    if (p->m_link_cfs_config && p->m_link_cfs_config->GetContainingSizer())
+        p->m_link_cfs_config->GetContainingSizer()->Layout();
+    Layout();
+}
+
+void Sidebar::start_cfs_socket_session(const std::string& host, const std::string& origin)
+{
+    stop_cfs_socket_session();
+
+    auto runtime = std::make_shared<CfsSocketRuntime>();
+    {
+        std::lock_guard<std::mutex> lock(runtime->mutex);
+        runtime->host = host;
+        runtime->origin = origin;
+        runtime->request_boxs_info = true;
+    }
+
+    p->cfs_socket_host = host;
+    p->cfs_socket_origin = origin;
+    p->cfs_socket_runtime = runtime;
+    p->cfs_socket_thread = std::thread([runtime]() {
+        run_cfs_socket_session(runtime);
+    });
+    BOOST_LOG_TRIVIAL(info) << "CFS socket: started persistent session for '" << host << "'";
+}
+
+void Sidebar::stop_cfs_socket_session()
+{
+    if (p->cfs_socket_runtime) {
+        {
+            std::lock_guard<std::mutex> lock(p->cfs_socket_runtime->mutex);
+            p->cfs_socket_runtime->stop_requested = true;
+        }
+        if (p->cfs_socket_thread.joinable())
+            p->cfs_socket_thread.join();
+        p->cfs_socket_runtime.reset();
+    }
+
+    p->cfs_socket_host.clear();
+    p->cfs_socket_origin.clear();
+    p->cfs_socket_connected = false;
+    p->cfs_last_applied_generation = 0;
+    p->cfs_ignore_outbound_color_sync_slots.clear();
+    p->cfs_pending_local_overrides.clear();
+}
+
+void Sidebar::request_cfs_boxs_info()
+{
+    if (!p->cfs_socket_runtime)
+        return;
+
+    std::lock_guard<std::mutex> lock(p->cfs_socket_runtime->mutex);
+    p->cfs_socket_runtime->request_boxs_info = true;
+}
+
+void Sidebar::queue_cfs_color_push(int filament_idx)
+{
+    if (filament_idx < 0)
+        return;
+
+    if (p->cfs_ignore_outbound_color_sync_slots.erase(filament_idx) > 0) {
+        BOOST_LOG_TRIVIAL(warning) << "CFS socket: skipped outbound color push for slot " << filament_idx
+                                   << " because the change came from a CFS sync";
+        return;
+    }
+
+    if (!p->cfs_auto_sync_enabled || !p->cfs_socket_runtime)
+        return;
+
+    auto* color_opt = wxGetApp().preset_bundle->project_config.option<ConfigOptionStrings>("filament_colour");
+    if (!color_opt || filament_idx >= static_cast<int>(color_opt->values.size()))
+        return;
+
+    const std::string color = normalize_cfs_color(color_opt->values[filament_idx]);
+    if (color.empty()) {
+        BOOST_LOG_TRIVIAL(warning) << "CFS socket: skipped outbound color push for slot " << filament_idx
+                                   << " because Orca color is empty or invalid";
+        return;
+    }
+
+    if (!cfs_socket_queue_modify_material(p->cfs_socket_runtime, static_cast<size_t>(filament_idx), color)) {
+        BOOST_LOG_TRIVIAL(warning) << "CFS socket: failed to queue outbound color push for slot " << filament_idx
+                                   << " because no CFS material metadata are available yet";
+        return;
+    }
+
+    p->cfs_pending_local_overrides[filament_idx] = CfsPendingLocalOverride{
+        color,
+        {},
+        std::chrono::steady_clock::now()
+    };
+
+    BOOST_LOG_TRIVIAL(warning) << "CFS socket: queued outbound color push for slot "
+                               << filament_idx << " color=" << color;
+}
+
+void Sidebar::queue_cfs_preset_push(int filament_idx)
+{
+    if (filament_idx < 0)
+        return;
+
+    if (!p->cfs_auto_sync_enabled || !is_cfs_auto_apply_preset_enabled() || !p->cfs_socket_runtime)
+        return;
+
+    auto& filament_presets = wxGetApp().preset_bundle->filament_presets;
+    if (filament_idx >= static_cast<int>(filament_presets.size()))
+        return;
+
+    const std::string preset_name = Preset::remove_suffix_modified(filament_presets[filament_idx]);
+    const std::string material_type = get_cfs_material_type_for_preset(preset_name);
+    if (material_type.empty()) {
+        BOOST_LOG_TRIVIAL(warning) << "CFS socket: skipped outbound preset push for slot " << filament_idx
+                                   << " because preset '" << preset_name << "' has no configured CFS type mapping";
+        return;
+    }
+
+    const auto* preset_definition = find_cfs_material_preset_definition(material_type);
+    if (!preset_definition) {
+        BOOST_LOG_TRIVIAL(warning) << "CFS socket: skipped outbound preset push for slot " << filament_idx
+                                   << " because no CFS preset definition exists for type " << material_type;
+        return;
+    }
+
+    auto* color_opt = wxGetApp().preset_bundle->project_config.option<ConfigOptionStrings>("filament_colour");
+    std::string color = color_opt && filament_idx < static_cast<int>(color_opt->values.size())
+        ? normalize_cfs_color(color_opt->values[filament_idx])
+        : std::string{};
+
+    CfsSlotMaterial slot_material;
+    {
+        std::lock_guard<std::mutex> lock(p->cfs_socket_runtime->mutex);
+        if (static_cast<size_t>(filament_idx) >= p->cfs_socket_runtime->slot_materials.size()) {
+            BOOST_LOG_TRIVIAL(warning) << "CFS socket: failed to queue outbound preset push for slot " << filament_idx
+                                       << " because no CFS slot metadata are available yet";
+            return;
+        }
+        slot_material = p->cfs_socket_runtime->slot_materials[filament_idx];
+    }
+
+    if (slot_material.material_id < 0) {
+        BOOST_LOG_TRIVIAL(warning) << "CFS socket: failed to queue outbound preset push for slot " << filament_idx
+                                   << " because CFS material id is missing";
+        return;
+    }
+
+    if (color.empty())
+        color = normalize_cfs_color(slot_material.color);
+    if (color.empty())
+        color = "#000000";
+
+    json payload = {
+        {"boxId", slot_material.box_id},
+        {"id", slot_material.material_id},
+        {"rfid", std::string(preset_definition->rfid)},
+        {"type", std::string(preset_definition->type)},
+        {"vendor", std::string(preset_definition->vendor)},
+        {"name", std::string(preset_definition->name)},
+        {"color", encode_cfs_printer_color(color)},
+        {"minTemp", std::string(preset_definition->temp_min)},
+        {"maxTemp", std::string(preset_definition->temp_max)},
+        {"pressure", std::string(preset_definition->pressure)}
+    };
+
+    if (!cfs_socket_queue_modify_material_payload(p->cfs_socket_runtime, std::move(payload))) {
+        BOOST_LOG_TRIVIAL(warning) << "CFS socket: failed to queue outbound preset push for slot " << filament_idx;
+        return;
+    }
+
+    p->cfs_pending_local_overrides[filament_idx] = CfsPendingLocalOverride{
+        color,
+        material_type,
+        std::chrono::steady_clock::now()
+    };
+
+    BOOST_LOG_TRIVIAL(warning) << "CFS socket: queued outbound preset push for slot "
+                               << filament_idx
+                               << " preset=" << preset_name
+                               << " type=" << material_type
+                               << " color=" << color;
+}
+
+void Sidebar::refresh_cfs_sync_state(bool force_probe)
+{
+    if (!is_cfs_supported_printer()) {
+        stop_cfs_socket_session();
+        if (p->m_bpButton_cfs_filament)
+            p->m_bpButton_cfs_filament->Hide();
+        if (p->m_link_cfs_config)
+            p->m_link_cfs_config->Hide();
+        return;
+    }
+
+    const auto host = get_cfs_socket_host();
+    const auto origin = get_cfs_socket_origin();
+    if (host.empty()) {
+        stop_cfs_socket_session();
+        BOOST_LOG_TRIVIAL(info) << "CFS socket: session stopped because printer host is empty";
+        apply_cfs_sync_button_visibility();
+        return;
+    }
+
+    const bool host_changed = host != p->cfs_socket_host || origin != p->cfs_socket_origin;
+    if (!p->cfs_socket_runtime || host_changed) {
+        start_cfs_socket_session(host, origin);
+    } else if (force_probe) {
+        request_cfs_boxs_info();
+    }
+
+    if (p->cfs_socket_runtime) {
+        std::lock_guard<std::mutex> lock(p->cfs_socket_runtime->mutex);
+        const bool recent_success =
+            p->cfs_socket_runtime->has_recent_success &&
+            (std::chrono::steady_clock::now() - p->cfs_socket_runtime->last_success_at) < cfs_socket_recent_success_window;
+        p->cfs_socket_connected = p->cfs_socket_runtime->connected || recent_success;
+    } else {
+        p->cfs_socket_connected = false;
+    }
+
+    update_cfs_auto_sync_ui();
+}
+
+bool Sidebar::sync_cfs_colors()
+{
+    wxBusyCursor cursor;
+
+    if (p->cfs_auto_sync_enabled) {
+        BOOST_LOG_TRIVIAL(warning) << "CFS socket: auto color sync disabled by user";
+        set_cfs_auto_sync_enabled(false);
+        update_cfs_auto_sync_ui();
+        return true;
+    }
+
+    const auto host = get_cfs_socket_host();
+    BOOST_LOG_TRIVIAL(warning) << "CFS socket: enabling auto color sync for host '" << host << "'";
+    if (host.empty()) {
+        MessageDialog dlg(this, _L("Set a printer host before synchronizing CFS colors."), _L("Sync filament colors"), wxOK);
+        dlg.ShowModal();
+        return false;
+    }
+
+    refresh_cfs_sync_state(true);
+    request_cfs_boxs_info();
+
+    std::vector<std::string> colors;
+    std::vector<std::string> material_types;
+    for (int attempt = 0; attempt < 12; ++attempt) {
+        refresh_cfs_sync_state();
+        if (p->cfs_socket_runtime) {
+            std::lock_guard<std::mutex> lock(p->cfs_socket_runtime->mutex);
+            colors = p->cfs_socket_runtime->colors;
+            material_types = p->cfs_socket_runtime->material_types;
+            const bool recent_success =
+                p->cfs_socket_runtime->has_recent_success &&
+                (std::chrono::steady_clock::now() - p->cfs_socket_runtime->last_success_at) < cfs_socket_recent_success_window;
+            p->cfs_socket_connected = p->cfs_socket_runtime->connected || recent_success;
+        }
+        const bool has_colors = std::any_of(colors.begin(), colors.end(), [](const std::string& color) { return !color.empty(); });
+        const bool has_types  = std::any_of(material_types.begin(), material_types.end(), [](const std::string& type) { return !type.empty(); });
+        if (p->cfs_socket_connected && (has_colors || has_types))
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    }
+
+    BOOST_LOG_TRIVIAL(warning) << "CFS socket: sync attempt finished with connected="
+                               << (p->cfs_socket_connected ? "true" : "false")
+                               << " colors=" << colors.size()
+                               << " material_types=" << material_types.size();
+    update_cfs_auto_sync_ui();
+
+    if (!p->cfs_socket_connected) {
+        BOOST_LOG_TRIVIAL(warning) << "CFS socket: manual color sync failed because socket connection did not succeed";
+        MessageDialog dlg(this, _L("Unable to connect to the CFS socket on the configured printer."), _L("Sync filament colors"), wxOK);
+        dlg.ShowModal();
+        return false;
+    }
+
+    const bool has_colors = std::any_of(colors.begin(), colors.end(), [](const std::string& color) { return !color.empty(); });
+    const bool has_types  = std::any_of(material_types.begin(), material_types.end(), [](const std::string& type) { return !type.empty(); });
+    if (!has_colors && !has_types) {
+        BOOST_LOG_TRIVIAL(warning) << "CFS socket: manual color sync connected but returned no material data";
+        MessageDialog dlg(this, _L("Connected to the CFS socket, but no filament data were returned."), _L("Sync filament colors"), wxOK);
+        dlg.ShowModal();
+        return false;
+    }
+
+    bool applied = apply_cfs_materials_to_ui(colors, material_types, true, "manual color sync");
+    if (applied) {
+        set_cfs_auto_sync_enabled(true);
+        if (p->cfs_socket_runtime) {
+            std::lock_guard<std::mutex> lock(p->cfs_socket_runtime->mutex);
+            p->cfs_last_applied_generation = p->cfs_socket_runtime->colors_generation;
+        }
+        update_cfs_auto_sync_ui();
+        BOOST_LOG_TRIVIAL(warning) << "CFS socket: auto color sync enabled";
+    }
+    return applied;
 }
 
 void Sidebar::sync_ams_list(bool is_from_big_sync_btn)
@@ -3722,6 +5252,10 @@ void Sidebar::show_SEMM_buttons(bool bshow)
         p->m_bpButton_add_filament->Show(bshow);
     if (p->m_bpButton_del_filament && p->combos_filament.size() > 1) // ORCA add filament count as condition to prevent showing Flushing volumes and Del Filament icon visible while only 1 filament exist
         p->m_bpButton_del_filament->Show(bshow);
+    if (p->m_bpButton_cfs_filament)
+        p->m_bpButton_cfs_filament->Show(is_cfs_supported_printer() && (!get_cfs_socket_host().empty() || p->cfs_auto_sync_enabled));
+    if (p->m_link_cfs_config)
+        p->m_link_cfs_config->Show(is_cfs_supported_printer() && (!get_cfs_socket_host().empty() || p->cfs_auto_sync_enabled));
     if (p->m_flushing_volume_btn && p->combos_filament.size() > 1) // ORCA add filament count as condition to prevent showing Flushing volumes and Del Filament icon visible while only 1 filament exist
         p->m_flushing_volume_btn->Show(bshow);
     Layout();
@@ -3965,6 +5499,7 @@ void Sidebar::update_ui_from_settings()
     p->plater->canvas3D()->update_gizmos_on_off_state();
     p->plater->set_current_canvas_as_dirty();
     p->plater->get_current_canvas3D()->request_extra_frame();
+    refresh_cfs_sync_state();
 #if 0
     p->object_list->apply_volumes_order();
 #endif
@@ -10322,7 +11857,7 @@ void Plater::priv::on_filament_color_changed(wxCommandEvent &event)
 {
     //q->update_all_plate_thumbnails(true);
     //q->get_preview_canvas3D()->update_plate_thumbnails();
-    int modify_id = event.GetInt();
+    const int modify_id = event.GetInt();
 
     auto& ams_multi_color_filment = wxGetApp().preset_bundle->ams_multi_color_filment;
     if (modify_id >= 0 && modify_id < ams_multi_color_filment.size())
@@ -10331,6 +11866,8 @@ void Plater::priv::on_filament_color_changed(wxCommandEvent &event)
     if (wxGetApp().app_config->get("auto_calculate_flush") != "disabled") {
         sidebar->auto_calc_flushing_volumes(modify_id);
     }
+
+    sidebar->queue_cfs_color_push(modify_id);
 }
 
 void Plater::priv::install_network_plugin(wxCommandEvent &event)
@@ -16329,6 +17866,8 @@ void Plater::on_filament_change(size_t filament_idx)
     if (filament == nullptr)
         return;
     std::string filament_type = filament->config.option<ConfigOptionStrings>("filament_type")->values[0];
+    boost::algorithm::to_upper(filament_type);
+    sidebar().queue_cfs_preset_push(static_cast<int>(filament_idx));
 }
 
 // BBS.
