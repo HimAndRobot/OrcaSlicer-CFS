@@ -193,6 +193,9 @@ public:
     void load_ams_list(MachineObject* obj);
     std::map<int, DynamicPrintConfig> build_filament_ams_list(MachineObject* obj);
     void sync_ams_list(bool is_from_big_sync_btn = false);
+    bool sync_cfs_colors();
+    void queue_cfs_color_push(int filament_idx);
+    void queue_cfs_preset_push(int filament_idx);
     bool sync_extruder_list();
     bool need_auto_sync_extruder_list_after_connect_priner(const MachineObject* obj);
     void update_sync_status(const MachineObject* obj);
@@ -262,6 +265,27 @@ public:
     void set_need_auto_sync_after_connect_printer(bool need_auto_sync) { m_need_auto_sync_after_connect_printer = need_auto_sync; }
 
 private:
+    bool  apply_cfs_materials_to_ui(const std::vector<std::string>& colors, const std::vector<std::string>& material_types, bool force_reapply, const char* context);
+    bool  apply_cfs_presets_to_ui(const std::vector<std::string>& material_types, bool force_reapply, const char* context);
+    bool  apply_cfs_colors_to_ui(const std::vector<std::string>& colors, bool force_reapply, const char* context);
+    void  update_cfs_auto_sync_ui();
+    void  update_cfs_config_ui();
+    void  open_cfs_config_dialog();
+    void  update_cfs_filament_badges();
+    bool  is_cfs_supported_printer() const;
+    void  handle_cfs_auto_sync_tick();
+    bool  is_cfs_auto_sync_enabled() const;
+    bool  is_cfs_auto_apply_preset_enabled() const;
+    void  set_cfs_auto_sync_enabled(bool enabled);
+    std::string get_cfs_preset_mapping_for_type(const std::string& material_type) const;
+    std::string get_cfs_material_type_for_preset(const std::string& preset_name) const;
+    void  refresh_cfs_sync_state(bool force_probe = false);
+    void  apply_cfs_sync_button_visibility();
+    std::string get_cfs_socket_host() const;
+    std::string get_cfs_socket_origin() const;
+    void  start_cfs_socket_session(const std::string& host, const std::string& origin);
+    void  stop_cfs_socket_session();
+    void  request_cfs_boxs_info();
     void  auto_calc_flushing_volumes_internal(const int filament_id, const int extruder_id);
 
 private:
