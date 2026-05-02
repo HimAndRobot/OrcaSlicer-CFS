@@ -10,6 +10,20 @@ LOG_DIR="$REPO_DIR/build-logs-$SAFE_BRANCH"
 CMAKE_BIN="${ORCA_CMAKE_BIN:-cmake}"
 NPROC="$(sysctl -n hw.ncpu)"
 ACTIVE_DEV_DIR="$(xcode-select -p 2>/dev/null || true)"
+RAW_ARCH="$(uname -m)"
+
+case "$RAW_ARCH" in
+  arm64|aarch64)
+    OSX_ARCH="arm64"
+    ;;
+  x86_64|amd64)
+    OSX_ARCH="x86_64"
+    ;;
+  *)
+    echo "Unsupported macOS architecture: $RAW_ARCH"
+    exit 1
+    ;;
+esac
 
 if [ -d "/opt/homebrew/opt/texinfo/bin" ]; then
   export PATH="/opt/homebrew/opt/texinfo/bin:$PATH"
@@ -67,6 +81,7 @@ mkdir -p "$LOG_DIR"
 
 echo "Using CMake: $CMAKE_BIN"
 "$CMAKE_BIN" --version | head -n 1
+echo "OSX arch: $OSX_ARCH"
 echo "Developer dir: ${DEVELOPER_DIR:-<unset>}"
 echo "SDKROOT: ${SDKROOT:-<unset>}"
 echo "CC: ${CC:-<unset>}"
@@ -83,14 +98,14 @@ mkdir -p "$DEPS_BUILD_DIR"
 cd "$DEPS_BUILD_DIR"
 
 echo "Building dependencies..."
-"$CMAKE_BIN" .. -DCMAKE_BUILD_TYPE=Release 2>&1 | tee "$LOG_DIR/deps-configure.log"
+"$CMAKE_BIN" .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="$OSX_ARCH" 2>&1 | tee "$LOG_DIR/deps-configure.log"
 "$CMAKE_BIN" --build . --config Release -j1 2>&1 | tee "$LOG_DIR/deps-build.log"
 
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 
 echo "Building OrcaSlicer..."
-"$CMAKE_BIN" .. -DORCA_TOOLS=ON -DCMAKE_BUILD_TYPE=Release 2>&1 | tee "$LOG_DIR/orca-configure.log"
+"$CMAKE_BIN" .. -DORCA_TOOLS=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="$OSX_ARCH" 2>&1 | tee "$LOG_DIR/orca-configure.log"
 "$CMAKE_BIN" --build . --config Release -j"$NPROC" 2>&1 | tee "$LOG_DIR/orca-build.log"
 
 echo
