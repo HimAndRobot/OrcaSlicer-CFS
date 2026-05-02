@@ -1,3 +1,7 @@
+param(
+    [string]$CmakeExe = $env:ORCA_CMAKE_EXE
+)
+
 $ErrorActionPreference = 'Stop'
 
 $repo = "C:\Users\conta\OneDrive\Documentos\Projetos\OrcaSlicer"
@@ -7,6 +11,10 @@ $branch = (git -C $repo rev-parse --abbrev-ref HEAD).Trim()
 $safeBranch = ($branch -replace '[^A-Za-z0-9._-]', '_')
 $buildDir = Join-Path $repo ("build-" + $safeBranch)
 $depsBuildDir = Join-Path $repo ("deps\\build-" + $safeBranch)
+
+if ([string]::IsNullOrWhiteSpace($CmakeExe)) {
+    $CmakeExe = "cmake"
+}
 
 function Assert-LastExitCode {
     param(
@@ -27,7 +35,20 @@ ForEach-Object {
     }
 }
 
-$env:PATH = "C:\Program Files\CMake\bin;C:\Strawberry\perl\bin;$env:PATH"
+$env:PATH = "C:\Strawberry\perl\bin;$env:PATH"
+
+$cmakeVersionOutput = & $CmakeExe --version
+Assert-LastExitCode "$CmakeExe --version"
+$cmakeVersionText = ($cmakeVersionOutput | Select-Object -First 1)
+Write-Host "Using CMake: $CmakeExe"
+Write-Host $cmakeVersionText
+
+if ($cmakeVersionText -match 'cmake version ([0-9]+)\.([0-9]+)\.([0-9]+)') {
+    $cmakeMajor = [int]$matches[1]
+    if ($branch -eq 'heads/v2.3.2' -and $cmakeMajor -ge 4) {
+        throw "Branch heads/v2.3.2 should be built with CMake 3.x. Current CMake is 4.x. Pass -CmakeExe with a CMake 3.x path."
+    }
+}
 
 Write-Host "Building dependencies..."
 Set-Location "$repo\deps"
@@ -35,8 +56,8 @@ if (!(Test-Path $depsBuildDir)) {
     New-Item -ItemType Directory -Path $depsBuildDir | Out-Null
 }
 Set-Location $depsBuildDir
-& cmake .. -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
-Assert-LastExitCode "cmake .. -G `"Visual Studio 17 2022`" -A x64 -DCMAKE_BUILD_TYPE=Release"
+& $CmakeExe .. -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
+Assert-LastExitCode "$CmakeExe .. -G `"Visual Studio 17 2022`" -A x64 -DCMAKE_BUILD_TYPE=Release"
 & $msbuild deps.vcxproj /t:Build /p:Configuration=Release /m:1 /v:minimal /nologo
 Assert-LastExitCode "msbuild deps.vcxproj /t:Build /p:Configuration=Release /m:1 /v:minimal /nologo"
 
@@ -46,8 +67,8 @@ if (!(Test-Path $buildDir)) {
     New-Item -ItemType Directory -Path $buildDir | Out-Null
 }
 Set-Location $buildDir
-& cmake .. -G "Visual Studio 17 2022" -A x64 -DORCA_TOOLS=ON -DCMAKE_BUILD_TYPE=Release
-Assert-LastExitCode "cmake .. -G `"Visual Studio 17 2022`" -A x64 -DORCA_TOOLS=ON -DCMAKE_BUILD_TYPE=Release"
+& $CmakeExe .. -G "Visual Studio 17 2022" -A x64 -DORCA_TOOLS=ON -DCMAKE_BUILD_TYPE=Release
+Assert-LastExitCode "$CmakeExe .. -G `"Visual Studio 17 2022`" -A x64 -DORCA_TOOLS=ON -DCMAKE_BUILD_TYPE=Release"
 & $msbuild ALL_BUILD.vcxproj /t:Build /p:Configuration=Release /m:1 /v:minimal /nologo
 Assert-LastExitCode "msbuild ALL_BUILD.vcxproj /t:Build /p:Configuration=Release /m:1 /v:minimal /nologo"
 & $msbuild INSTALL.vcxproj /t:Build /p:Configuration=Release /m:1 /v:minimal /nologo
