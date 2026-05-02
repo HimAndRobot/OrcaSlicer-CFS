@@ -4244,6 +4244,8 @@ void Sidebar::open_cfs_config_dialog()
         for (const auto& preset : presets) {
             if (preset.is_default)
                 continue;
+            if (!preset.is_visible || !preset.is_compatible)
+                continue;
             if (!seen.insert(preset.name).second)
                 continue;
             choices.Add(from_u8(preset.name));
@@ -4251,18 +4253,8 @@ void Sidebar::open_cfs_config_dialog()
         return choices;
     };
 
-    const auto ensure_choice = [](wxArrayString& choices, const std::string& current_value) {
-        if (current_value.empty())
-            return;
-        const wxString wx_value = from_u8(current_value);
-        if (choices.Index(wx_value) == wxNOT_FOUND)
-            choices.Add(wx_value);
-    };
-
     wxArrayString preset_choices = collect_preset_names();
     const auto material_types = cfs_supported_material_types();
-    for (const auto& material_type : material_types)
-        ensure_choice(preset_choices, get_cfs_preset_mapping_for_type(material_type));
 
     auto* root = new wxBoxSizer(wxVERTICAL);
     root->SetMinSize(wxSize(dlg.FromDIP(420), -1));
@@ -4296,7 +4288,8 @@ void Sidebar::open_cfs_config_dialog()
         for (const auto& choice : preset_choices)
             combo->Append(choice);
         const int selected_index = combo->FindString(from_u8(selected_name));
-        combo->SetSelection(selected_index == wxNOT_FOUND ? 0 : selected_index);
+        if (selected_index != wxNOT_FOUND)
+            combo->SetSelection(selected_index);
         row->Add(label, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, dlg.FromDIP(10));
         row->Add(combo, 1, wxEXPAND);
         return std::pair<wxBoxSizer*, ::ComboBox*>(row, combo);

@@ -1,21 +1,9 @@
 name: Build Fork Release
 
 on:
-  push:
-    branches:
-      - v2.3.2
   workflow_dispatch:
 
 jobs:
-  build_windows:
-    if: ${{ !cancelled() }}
-    uses: ./.github/workflows/build_check_cache.yml
-    with:
-      os: windows-latest
-      build-deps-only: false
-      force-build: true
-    secrets: inherit
-
   build_macos_arch:
     if: ${{ !cancelled() }}
     strategy:
