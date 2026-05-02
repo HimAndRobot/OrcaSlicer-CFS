@@ -1,0 +1,44 @@
+name: Build Fork Release
+
+on:
+  push:
+    branches:
+      - v2.3.2
+  workflow_dispatch:
+
+jobs:
+  build_windows:
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/build_check_cache.yml
+    with:
+      os: windows-latest
+      build-deps-only: false
+      force-build: true
+    secrets: inherit
+
+  build_macos_arch:
+    if: ${{ !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - arm64
+          - x86_64
+    uses: ./.github/workflows/build_check_cache.yml
+    with:
+      os: macos-14
+      arch: ${{ matrix.arch }}
+      build-deps-only: false
+      force-build: true
+    secrets: inherit
+
+  build_macos_universal:
+    name: Build macOS Universal
+    needs: build_macos_arch
+    if: ${{ !cancelled() && needs.build_macos_arch.result == 'success' }}
+    uses: ./.github/workflows/build_orca.yml
+    with:
+      os: macos-14
+      arch: universal
+      macos-combine-only: true
+    secrets: inherit
