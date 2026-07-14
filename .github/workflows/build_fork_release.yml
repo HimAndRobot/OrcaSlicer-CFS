@@ -4,6 +4,16 @@ on:
   workflow_dispatch:
 
 jobs:
+  build_windows:
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/build_check_cache.yml
+    with:
+      os: windows-latest
+      arch: x64
+      build-deps-only: false
+      force-build: true
+    secrets: inherit
+
   build_macos_arch:
     if: ${{ !cancelled() }}
     strategy:
