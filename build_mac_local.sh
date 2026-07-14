@@ -23,7 +23,8 @@ if [ -n "${ORCA_CMAKE_BIN:-}" ]; then
     echo "ORCA_CMAKE_BIN is not executable: $ORCA_CMAKE_BIN"
     exit 1
   fi
-  export PATH="$(dirname "$ORCA_CMAKE_BIN"):$PATH"
+  ORCA_CMAKE_DIR="$(dirname "$ORCA_CMAKE_BIN")"
+  export PATH="$ORCA_CMAKE_DIR:$PATH"
 fi
 
 if [ -d "/opt/homebrew/opt/texinfo/bin" ]; then
