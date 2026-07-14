@@ -1,4 +1,6 @@
-if (MSVC)
+# Intel IPP / IPP-ICV is x86/x64 only — there is no ARM64 build, so enabling it
+# leaves ~200 unresolved ippicv* externals at link time on Windows ARM64.
+if (MSVC AND NOT "${DEPS_ARCH}" STREQUAL "arm64")
     set(_use_IPP "-DWITH_IPP=ON")
 else ()
     set(_use_IPP "-DWITH_IPP=OFF")
@@ -55,6 +57,8 @@ orcaslicer_add_cmake_project(OpenCV
        -DWITH_VTK=OFF
        -DWITH_JPEG=OFF
        -DWITH_WEBP=OFF
+       -DWITH_TIFF=OFF
+       -DBUILD_TIFF=OFF
        -DENABLE_PRECOMPILED_HEADERS=OFF
        -DINSTALL_TESTS=OFF
        -DINSTALL_C_EXAMPLES=OFF

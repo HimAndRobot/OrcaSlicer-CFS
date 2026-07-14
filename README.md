@@ -1,6 +1,6 @@
 # OrcaSlicer CFS
 
-This is an OrcaSlicer `v2.3.2` fork with native **Creality CFS** integration for the **K1 / K1C / K1 Max** family.
+This is an OrcaSlicer `v2.4.2` fork with native **Creality CFS** integration for the **K1** and **K2** printer families.
 
 The goal of this fork is to make the filament workflow inside Orca much more direct:
 - sync filament colors from CFS into Orca
@@ -21,10 +21,13 @@ This fork adds:
 
 ## Supported printers
 
-The CFS button and integration are shown only when the active printer profile belongs to:
+The CFS button and integration are shown when the active printer profile belongs to:
 - `K1`
 - `K1C`
 - `K1 Max`
+- `K2`
+- `K2 Plus`
+- `K2 Pro`
 
 The printer also needs to be configured normally in Orca using its machine host settings.
 
@@ -123,7 +126,7 @@ When automatic material mapping is enabled:
 ## Notes
 
 - this fork is built specifically for the **Creality CFS** workflow
-- the main target is the **K1 / K1C / K1 Max** family
+- the main target is the **K1** and **K2** families
 - the primary experience lives in the filament sidebar
 - the CFS settings were kept inside a modal to avoid polluting the main interface
 
@@ -145,7 +148,7 @@ Builds for this fork should be published in the repository releases as:
 
 ## Project base
 
-This fork is still based on:
+This fork is based on:
 - [OrcaSlicer](https://github.com/OrcaSlicer/OrcaSlicer)
 
 ## License
